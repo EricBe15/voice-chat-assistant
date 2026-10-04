@@ -1,6 +1,6 @@
 # Voice Chat Assistant
 
-A fully local voice assistant for Windows. Everything runs on your own PC, with no cloud APIs and no API keys.
+A fully local voice assistant for Windows. Everything runs on your own PC, with no cloud APIs and no API keys. (Optional web search sends only search queries to DuckDuckGo; it's off by default.)
 
 ```
 microphone ─► Silero VAD ─► Whistle (speech to text) ─► llama.cpp (LLM) ─► Kokoro (text to speech) ─► speakers
@@ -42,6 +42,12 @@ python download_models.py
 winget install ggml.llamacpp
 ```
 
+On an Apple Silicon Mac, use `brew install llama.cpp` instead of winget and Python with Tk (e.g. Homebrew's 3.13; its 3.14 has no tkinter). Then also install Kokoro for the GPU, without its dependencies:
+
+```bash
+pip install --no-deps mlx-audio==0.5.7
+```
+
 Check the pieces one at a time:
 
 ```powershell
@@ -60,7 +66,11 @@ The server is started with `-ngl 99 -c 8192` (all layers on the GPU, 8k context)
 
 ### Settings
 
-The gear icon opens the settings: model, voice (or "auto" to match the language you speak), speed, whether you can interrupt by talking, and the personality prompt. They are saved to `settings.json` next to the scripts. That file isn't committed because it holds local paths. Without it, the app uses the defaults in `assistant.py`.
+The gear icon opens the settings: model, speech recognition (Whistle, or Parakeet on Apple Silicon), voice (or "auto" to match the language you speak), speed, whether you can interrupt by talking, web search, and the personality prompt. They are saved to `settings.json` next to the scripts. That file isn't committed because it holds local paths. Without it, the app uses the defaults in `assistant.py`.
+
+### Web search (optional, off by default)
+
+With **Let it search the web** switched on, the model can call a `web_search` tool for news and other current facts. The app sends the search query to DuckDuckGo (`html.duckduckgo.com`) and gives the model the top five result titles and snippets; it doesn't open the pages. For weather it uses a separate `weather` tool instead, because search snippets rarely contain the numbers: it sends just the place name to [Open-Meteo](https://open-meteo.com) (free, no key) and gets the current weather and a 3-day forecast. Questions with words like "latest", "news", "today" or "weather" always search first, because a small model tends to answer those from its dated knowledge. Only the queries leave your PC. DuckDuckGo can rate-limit heavy use, and then the assistant says the search failed.
 
 ## Files that stay local
 

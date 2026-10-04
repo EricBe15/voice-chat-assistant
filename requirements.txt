@@ -1,8 +1,13 @@
 # Tested with Python 3.14 on Windows 10
 cactus-needle[mic]==3.1.0   # Whistle speech-to-text (weights download on first run)
 kokoro-onnx==0.4.7          # Kokoro text-to-speech
+livekit==1.1.20             # WebRTC echo canceller (AEC3) for the assistant's own voice
 onnxruntime==1.30.0         # Silero VAD speech detector
+parakeet-mlx==0.5.3; sys_platform == "darwin" and platform_machine == "arm64"  # optional, more accurate speech to text (Apple Silicon)
 numpy==2.2.6
 requests==2.32.5
 sounddevice==0.5.5
 soxr==1.1.0
+# On Apple Silicon, also: pip install --no-deps mlx-audio==0.5.7
+# (Kokoro on the GPU, ~10x faster. --no-deps: its full dependencies would downgrade huggingface_hub
+# and pull in transformers, neither of which the Kokoro model needs.)

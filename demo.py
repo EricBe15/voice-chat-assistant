@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")  # Windows without Developer Mode
+os.environ["NEEDLE_TELEMETRY"] = "0"  # cactus-needle usage counts
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"  # huggingface_hub, used for the first-run downloads
 
 from needle.agent.whistle import Whistle, record
 

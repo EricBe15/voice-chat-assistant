@@ -11,9 +11,12 @@ import re
 import threading
 import time
 import tkinter as tk
+import unicodedata
 from collections import deque
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")  # Windows without Developer Mode
+os.environ["NEEDLE_TELEMETRY"] = "0"  # cactus-needle usage counts
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"  # huggingface_hub, used for the first-run downloads
 
 import numpy as np
 import sounddevice as sd
@@ -34,6 +37,9 @@ VAD_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "
 VAD_WINDOW = 512     # 32 ms at 16 kHz, the size Silero expects
 SPEECH_PROB = 0.5    # windows at or above this are speech
 MIN_SPEECH = 0.16    # seconds of speech before a phrase counts (a short "no" has ~0.25)
+# Speech from a TV or a video in the room is still speech, just far quieter: on a MacBook mic it peaked
+# at 0.005-0.006, while someone talking to the assistant peaked at 0.05-0.2. Only louder windows count.
+SPEECH_LEVEL = 0.02
 # What Whistle says about non-speech; a backup filter for when the detector lets one through.
 FILLERS = {"thank you", "thank you very much", "thanks for watching", "thanks", "bye", "you",
            "vielen dank", "danke", "danke schön", "merci", "gracias", "grazie", "dank je wel", "dziękuję"}
@@ -71,11 +77,16 @@ class Transcriber(threading.Thread):
         self.paused = threading.Event()    # set: the mic is ignored (e.g. while an assistant speaks)
         self.speaking = threading.Event()  # set: an assistant is talking, only listen for interruptions
         self.flush = threading.Event()     # set: drop the audio heard so far
+        self.idle = threading.Event()      # set: the mic is closed (no session running)
+        self.idle.set()
         self.after_final = None            # "pause" or "speaking": set that event before a phrase is reported
         self.is_echo = lambda text: False  # tells the assistant's own voice apart from an interruption
+        self.cancel_echo = None            # takes 16 kHz mic samples, returns them without the assistant's voice
+        self.final_transcribe = None       # another model for the final text of a phrase; returns None to keep Whistle's
         self.log_dir = None                # a folder: save every phrase's audio and transcript there
         self.pause = PAUSE
         self.language = None
+        self.timing = {}                   # perf_counter marks of the last commit, for the latency log
 
     def run(self):
         self.events.put(("status", "Loading Whistle..."))
@@ -88,11 +99,14 @@ class Transcriber(threading.Thread):
         self.events.put(("ready", None))
         while True:
             self.recording.wait()
+            self.idle.clear()
             try:
                 self.session()
             except Exception as error:
                 self.recording.clear()
                 self.events.put(("error", str(error)))
+            finally:
+                self.idle.set()
 
     def transcribe(self, audio):
         if len(audio) < SAMPLE_RATE // 4:
@@ -115,10 +129,10 @@ class Transcriber(threading.Thread):
         step = rate // 50  # one waveform bar per 20 ms
 
         def callback(data, *_):
+            samples = data[:, 0].copy()
+            self.chunks.put(samples)  # also while paused, so an echo canceller hears the mic without gaps
             if self.paused.is_set():
                 return
-            samples = data[:, 0].copy()
-            self.chunks.put(samples)
             usable = len(samples) // step * step
             if usable and not self.speaking.is_set():  # drawn from here so it stays smooth; shows the assistant meanwhile
                 self.events.put(("wave", np.abs(samples[:usable]).reshape(-1, step).max(axis=1).tolist()))
@@ -132,6 +146,8 @@ class Transcriber(threading.Thread):
                     continue
                 if resampler is not None:
                     chunk = resampler.resample_chunk(chunk)
+                if self.cancel_echo is not None:
+                    chunk = self.cancel_echo(chunk)
                 if self.paused.is_set() or self.flush.is_set():
                     self.flush.clear()
                     phrase, pending = np.zeros(0, np.float32), np.zeros(0, np.float32)
@@ -145,11 +161,12 @@ class Transcriber(threading.Thread):
                     window, pending = pending[:VAD_WINDOW], pending[VAD_WINDOW:]
                     if self.detector(window) >= SPEECH_PROB:
                         silent_for = 0.0
-                        if voiced == 0:
-                            first_speech = len(phrase) - len(pending) - VAD_WINDOW
-                        voiced += VAD_WINDOW
-                        if not heard_speech and voiced >= MIN_SPEECH * SAMPLE_RATE:
-                            heard_speech, speech_at = True, max(0, first_speech)
+                        if np.abs(window).max() >= SPEECH_LEVEL:  # loud enough to be you, not a TV
+                            if voiced == 0:
+                                first_speech = len(phrase) - len(pending) - VAD_WINDOW
+                            voiced += VAD_WINDOW
+                            if not heard_speech and voiced >= MIN_SPEECH * SAMPLE_RATE:
+                                heard_speech, speech_at = True, max(0, first_speech)
                     else:
                         silent_for += VAD_WINDOW / SAMPLE_RATE
 
@@ -166,6 +183,8 @@ class Transcriber(threading.Thread):
                             self.speaking.clear()
                             self.events.put(("interrupt", text))
                             continue  # keep the phrase: it carries on as the next turn
+                        if text:
+                            self.log(phrase, voiced, "not_interrupt", text)  # judged its own voice or a filler
                     if silent_for >= self.pause:
                         phrase, heard_speech, silent_for, voiced = pending.copy(), False, 0.0, 0
                     elif seconds > 3.0:
@@ -194,9 +213,17 @@ class Transcriber(threading.Thread):
 
     def commit(self, phrase, voiced):
         self.detected = None
+        self.timing = {"committed": time.perf_counter()}  # your pause has just been long enough
         text = self.transcribe(phrase)
+        noise = is_noise(text, phrase, voiced)
+        if not noise and self.final_transcribe is not None:  # Whistle still judges noise and the language
+            self.timing["whistle"] = time.perf_counter()
+            better = self.final_transcribe(phrase)
+            if better and latin(better):  # Parakeet can't be told the language and wrote "Psychosis" in Cyrillic
+                text = better
+        self.timing["transcribed"] = time.perf_counter()
         self.log(phrase, voiced, "final", text)
-        if is_noise(text, phrase, voiced):
+        if noise:
             text = ""
         if text and self.after_final == "pause":
             self.paused.set()
@@ -222,6 +249,11 @@ class Transcriber(threading.Thread):
                  "assistant_speaking": self.speaking.is_set()}
         with open(os.path.join(self.log_dir, "phrases.jsonl"), "a", encoding="utf-8") as out:
             out.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def latin(text):
+    """Whether all letters are Latin ones, as in every language Whistle knows."""
+    return all("LATIN" in unicodedata.name(c, "") for c in text if c.isalpha())
 
 
 def is_filler(text):
