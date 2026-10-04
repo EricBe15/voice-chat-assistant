@@ -1,16 +1,17 @@
 # Voice Chat Assistant
 
-A fully local voice assistant for Windows. Everything runs on your own PC, with no cloud APIs and no API keys. (Optional web search sends only search queries to DuckDuckGo; it's off by default.)
+A fully local voice assistant for Windows and Apple Silicon Macs. Everything runs on your own computer, with no cloud APIs and no API keys. The internet is only used to download the models once, and for the optional web search, which is off by default (see [Privacy](#privacy)).
 
 ```
-microphone ─► Silero VAD ─► Whistle + Parakeet (speech to text) ─► llama.cpp (LLM) ─► Kokoro (text to speech) ─► speakers
+microphone ─► echo canceller ─► Silero VAD ─► Whistle + Parakeet (speech to text) ─► llama.cpp (LLM) ─► Kokoro (text to speech) ─► speakers
 ```
 
-- **Whistle** (`cactus-needle`): on-device speech recognition for en, de, fr, es, it, nl and pl. Fast enough for the live preview and interruptions.
-- **Parakeet v3**: writes the final text of each phrase; better with names and unclear speech. Runs on the GPU with MLX on Apple Silicon and on the CPU with onnxruntime (`onnx-asr`) elsewhere. ~2.5 GB, downloaded on first start. When it returns nothing or a non-Latin script, Whistle's text is kept.
+- **Whistle** (`cactus-needle`): on-device speech recognition for en, de, fr, es, it, nl and pl. Fast enough for the live preview and interruptions, and it detects the language you speak.
+- **Parakeet v3**: writes the final text of each phrase; better with names and unclear speech. Runs on the GPU with MLX on Apple Silicon and on the CPU with onnxruntime (`onnx-asr`) elsewhere, adding ~0.1–0.2 s per phrase. ~2.5 GB, downloaded on first start. When it returns nothing or a non-Latin script, Whistle's text is kept.
+- **Echo canceller** (WebRTC AEC3 from `livekit`): removes the assistant's own voice from the mic, so it doesn't answer itself.
 - **Silero VAD**: tells speech apart from noise, so taps and breaths don't turn into "Thank you."
 - **llama.cpp**: `llama-server` runs any GGUF model. The app starts its own server on port 8091.
-- **Kokoro**: natural-sounding TTS in English, Spanish, French, Italian, Portuguese and Hindi.
+- **Kokoro**: natural-sounding TTS in English, Spanish, French, Italian, Portuguese and Hindi. On Apple Silicon it runs on the GPU (`mlx-audio`).
 
 Replies stream into the window and are spoken sentence by sentence. Talk over the assistant (or press Esc) to interrupt it.
 
@@ -18,7 +19,7 @@ Replies stream into the window and are spoken sentence by sentence. Talk over th
 
 | File | What it does |
 |---|---|
-| `start.bat` / `start.sh` | **Start here.** Sets everything up on the first run, then starts the assistant. Add `--debug` to save every heard phrase to `logs/phrases/`. |
+| `start.bat` / `start.sh` | **Start here.** Sets everything up on the first run, then starts the assistant. Add `--debug` to save every heard phrase to `logs/phrases/` and reply timings to `logs/latency.jsonl`. |
 | `install.bat` / `install.sh` | The same setup without starting the app (optional). |
 | `assistant.py` | The voice assistant window (main app). |
 | `live.py` | Live transcription window (speech to text only, no LLM). |
@@ -29,7 +30,7 @@ Replies stream into the window and are spoken sentence by sentence. Talk over th
 
 ## Setup
 
-Requirements: **Windows 10/11** or an **Apple Silicon Mac** (Linux should work too, untested), a microphone and speakers (headphones work best for interrupting). For larger LLMs you need an NVIDIA GPU on Windows; the 7B default runs fine on 8 GB of VRAM.
+Requirements: **Windows 10/11** or an **Apple Silicon Mac** (Linux should work too, untested), a microphone and speakers (headphones work best for interrupting), and ~10 GB of disk space for the models. You don't need Python installed beforehand. On Windows, an NVIDIA GPU runs the language model; the 7B default fits in 8 GB of VRAM. On a Mac it runs on the built-in GPU.
 
 ```powershell
 git clone https://github.com/EricBe15/voice-chat-assistant.git
@@ -87,11 +88,22 @@ With **Let it search the web** switched on, the model can call a `web_search` to
 - **"Could not load Kokoro"**: run the start script again, it fetches missing models.
 - **Packages broken after a Python update**: delete `.venv` and run the start script; it sets it up again.
 - **"llama-server stopped"**: read `logs/llama-server.log`. Usually the model doesn't fit in VRAM; pick a smaller model or lower `-ngl`.
-- **`llama-server` not found**: open a new terminal after `winget install`, or add its folder to PATH.
-- **It hears nothing / transcribes "Thank you."**: run `python mic_check.py` and check the default input device in Windows sound settings.
+- **`llama-server` not found**: the start scripts find a fresh winget or Homebrew install on their own. If you installed it elsewhere, add its folder to PATH.
+- **It hears nothing / transcribes "Thank you."**: run `.venv\Scripts\python mic_check.py` (`.venv/bin/python mic_check.py` on a Mac) and check the default input device in the system sound settings. On a Mac, also allow your terminal to use the microphone under System Settings › Privacy & Security › Microphone.
+- **"Could not load Parakeet, using Whistle"**: usually an interrupted download. Delete the `parakeet-tdt-0.6b-v3` folder in the Hugging Face cache (`~/.cache/huggingface/hub`) and start again, or switch to Whistle alone in the settings.
+- **The model download dialog appears again after downloading**: open an issue with your llama.cpp version (`llama-server --version`). The app looks for the model in `LLAMA_CACHE` and the Hugging Face cache, in both layouts llama.cpp has used.
 - **It interrupts itself**: use headphones, or turn off "Let me interrupt by talking" (Esc still works).
+
+## Privacy
+
+What goes over the network, and when:
+
+- **Model downloads, once:** Kokoro and Silero from GitHub, Whistle and Parakeet from Hugging Face, and the language model from Hugging Face after you confirm it.
+- **Web search and weather, only if you switch them on:** the search query goes to DuckDuckGo, the place name to Open-Meteo.
+
+Your voice, transcripts and conversations stay on your computer. The usage counts of `cactus-needle` and `huggingface_hub` are switched off.
 
 ## Notes
 
-- `llama-server` listens only on `127.0.0.1:8091` without an API key, so it is reachable from this PC only. Don't expose that port to a network.
+- `llama-server` listens only on `127.0.0.1:8091` without an API key, so it is reachable from this computer only. Don't expose that port to a network.
 - Runs on Windows 10/11 and Apple Silicon Macs. Platform-specific code (stopping `llama-server`, the llama.cpp cache path, the dark title bar, GPU Kokoro, and Parakeet on MLX or onnxruntime) checks `sys.platform` or skips what isn't installed.
