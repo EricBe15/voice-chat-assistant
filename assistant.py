@@ -34,10 +34,14 @@ ROOT = Path(__file__).parent
 SETTINGS_FILE = ROOT / "settings.json"
 LLAMA_PORT = 8091   # its own port, so other llama-servers (8080) are left alone
 LLAMA_URL = f"http://127.0.0.1:{LLAMA_PORT}"
-if sys.platform == "win32":
+if os.environ.get("LLAMA_CACHE"):  # llama-server reads it too
+    LLAMA_CACHE = Path(os.environ["LLAMA_CACHE"])
+elif sys.platform == "win32":
     LLAMA_CACHE = Path(os.environ.get("LOCALAPPDATA", "")) / "llama.cpp"
-else:
+elif sys.platform == "darwin":
     LLAMA_CACHE = Path.home() / "Library" / "Caches" / "llama.cpp"
+else:
+    LLAMA_CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "llama.cpp"
 OLLAMA_BLOBS = Path.home() / ".ollama" / "models" / "blobs"
 # (label, GGUF file, Hugging Face download used when the file is missing). For split
 # models the first part is enough; llama.cpp finds the rest. Only the ones present on
@@ -80,7 +84,7 @@ PROMPT_SUFFIX = (" The user's words come from speech recognition and may contain
                  "Always reply in {language}, and always say at least one short sentence, even when the user "
                  "only says something like hmm or okay.")
 DEFAULTS = {"voice": "af_heart", "speed": 1.0, "interrupt": True, "prompt": DEFAULT_PROMPT,
-            "model": str(MODELS[0][1]), "custom_models": [], "recognizer": "whistle", "web": False}
+            "model": str(MODELS[0][1]), "custom_models": [], "recognizer": "parakeet", "web": False}
 WEB_SEARCH = {"type": "function", "function": {
     "name": "web_search", "description": "Search the web (DuckDuckGo) for current or specific information.",
     "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "What to search for"}},
@@ -267,6 +271,25 @@ def model_args(model):
     raise RuntimeError(f"model file not found: {model}")
 
 
+def pending_download(model):
+    """The Hugging Face download ("repo:quant") a built-in model still needs, or None when it is on this PC.
+
+    Older llama-server builds keep a download as one file in LLAMA_CACHE (the path in MODELS), newer ones in
+    Hugging Face's layout (models--user--repo/snapshots/...) inside LLAMA_CACHE or the Hugging Face cache.
+    """
+    if Path(model).exists():
+        return None
+    download = next((d for _, path, d in MODELS if str(path) == model), None)
+    if download is None:
+        return None
+    from huggingface_hub.constants import HF_HUB_CACHE
+    repo, _, quant = download.partition(":")
+    for cache in (LLAMA_CACHE, Path(HF_HUB_CACHE)):
+        if any((cache / f"models--{repo.replace('/', '--')}" / "snapshots").glob(f"*/*{quant}*.gguf")):
+            return None
+    return download
+
+
 def model_label(model):
     for label, path, _ in MODELS:
         if str(path) == model:
@@ -351,13 +374,18 @@ MLX_CACHE = 256 * 2**20
 
 
 class Parakeet(threading.Thread):
-    """Parakeet TDT 0.6B v3 on MLX (Apple Silicon only): writes the final text of each phrase.
+    """Parakeet TDT 0.6B v3: writes the final text of each phrase.
 
-    Slower than Whistle (~0.2 s a phrase) and a ~2.5 GB download on first use. Whistle still does the live
-    preview, interruptions, noise and the language. MLX wants its model used on one thread, so it lives here.
+    On Apple Silicon it runs on the GPU with MLX (parakeet-mlx), elsewhere on the CPU with onnxruntime
+    (onnx-asr, ~0.1-0.15 s a phrase). Slower than Whistle and a ~2.5 GB download on first use. Whistle still
+    does the live preview, interruptions, noise and the language. MLX wants its model used on one thread, so
+    it lives here.
     """
 
-    REPO = "mlx-community/parakeet-tdt-0.6b-v3"
+    MLX_REPO = "mlx-community/parakeet-tdt-0.6b-v3"
+    ONNX_MODEL = "nemo-parakeet-tdt-0.6b-v3"
+    # The int8 version drops more short words ("Test") and hears "meth" as "myth", so the full one is used.
+    ONNX_REPO = "istupakov/parakeet-tdt-0.6b-v3-onnx"
 
     def __init__(self, events):
         super().__init__(daemon=True)
@@ -368,19 +396,9 @@ class Parakeet(threading.Thread):
     def run(self):
         self.events.put(("status", "Loading Parakeet (downloads ~2.5 GB the first time)..."))
         try:
-            import mlx.core as mx
-            from huggingface_hub import snapshot_download
-            from parakeet_mlx import from_pretrained
-            from parakeet_mlx.audio import get_logmel
-            try:
-                source = snapshot_download(self.REPO, local_files_only=True)  # no update check once downloaded
-            except Exception:
-                source = self.REPO
-            model = from_pretrained(source)
-            mx.set_cache_limit(MLX_CACHE)
-            # The first phrase is otherwise ~0.3 s slower (GPU kernels get compiled), so spend that now.
-            model.generate(get_logmel(mx.array(np.random.default_rng(0).normal(0, 0.01, SAMPLE_RATE), mx.float32),
-                                      model.preprocessor_config))
+            transcribe = self.load_mlx() if mlx_parakeet_installed() else self.load_onnx()
+            # The first phrase is otherwise slower (MLX compiles its GPU kernels), so spend that now.
+            transcribe(np.random.default_rng(0).normal(0, 0.01, SAMPLE_RATE).astype(np.float32))
         except Exception as error:
             self.events.put(("status", f"Could not load Parakeet, using Whistle: {error}"))
             return
@@ -389,11 +407,32 @@ class Parakeet(threading.Thread):
         while True:
             audio, reply = self.jobs.get()
             try:
-                mel = get_logmel(mx.array(audio, mx.float32), model.preprocessor_config)
-                reply.put(model.generate(mel)[0].text.strip())
+                reply.put(transcribe(audio))
             except Exception as error:
                 self.events.put(("status", f"Parakeet failed, kept Whistle's text: {error}"))
                 reply.put(None)
+
+    def load_mlx(self):
+        import mlx.core as mx
+        from parakeet_mlx import from_pretrained
+        from parakeet_mlx.audio import get_logmel
+        model = from_pretrained(downloaded(self.MLX_REPO) or self.MLX_REPO)
+        mx.set_cache_limit(MLX_CACHE)
+
+        def transcribe(audio):
+            return model.generate(get_logmel(mx.array(audio, mx.float32), model.preprocessor_config))[0].text.strip()
+        return transcribe
+
+    def load_onnx(self):
+        import onnx_asr
+        try:
+            model = onnx_asr.load_model(self.ONNX_MODEL, downloaded(self.ONNX_REPO), providers=["CPUExecutionProvider"])
+        except Exception:  # not downloaded yet, or only partly
+            model = onnx_asr.load_model(self.ONNX_MODEL, providers=["CPUExecutionProvider"])
+
+        def transcribe(audio):
+            return model.recognize(np.ascontiguousarray(audio, np.float32), sample_rate=SAMPLE_RATE).strip()
+        return transcribe
 
     def __call__(self, audio):
         """The phrase's text, or None (Whistle's is kept) while the model is still loading."""
@@ -525,9 +564,23 @@ def weather(place):
 TOOLS = {"web_search": (web_search, "query", "Searching the web"), "weather": (weather, "place", "Checking the weather")}
 
 
+def mlx_parakeet_installed():
+    import importlib.util
+    return sys.platform == "darwin" and importlib.util.find_spec("parakeet_mlx") is not None
+
+
 def parakeet_installed():
     import importlib.util
-    return importlib.util.find_spec("parakeet_mlx") is not None
+    return mlx_parakeet_installed() or importlib.util.find_spec("onnx_asr") is not None
+
+
+def downloaded(repo):
+    """The local copy of a Hugging Face repo, so loading skips the update check; None before the first download."""
+    from huggingface_hub import snapshot_download
+    try:
+        return snapshot_download(repo, local_files_only=True)
+    except Exception:
+        return None
 
 
 class Voice(threading.Thread):
@@ -855,6 +908,7 @@ class Assistant(App):
         self.user_open = False
         self.detected = None
         self.settings_window = None
+        self.llama_missing = None  # why the model isn't loading (its download was declined), shown until it is
         super().__init__(root)
         self.voice.events = self.events
         self.worker.pause = TURN_PAUSE
@@ -890,8 +944,15 @@ class Assistant(App):
         with self.server_lock:
             if model != self.settings["model"]:
                 return  # switched again while waiting; the newer thread loads that one
-            downloading = not Path(model).exists()
-            self.events.put(("status", f"Loading {model_label(model)}" + (" (downloading first)..." if downloading else "...")))
+            download = pending_download(model)
+            if download:
+                reply = queue.Queue(maxsize=1)
+                self.events.put(("ask_download", (model, download, reply)))
+                if not reply.get():
+                    self.events.put(("llama_missing", f"{model_label(model)} isn't downloaded. Pick another model "
+                                                      "in the settings (gear), or restart to be asked again."))
+                    return
+            self.events.put(("status", f"Loading {model_label(model)}" + (" (downloading first)..." if download else "...")))
             try:
                 self.server.start(model)
                 # The first request is seconds slower (GPU warm-up), so spend it while loading.
@@ -919,6 +980,7 @@ class Assistant(App):
         self.stop_reply()
         self.state = "loading"
         self.waiting.add("llama")
+        self.llama_missing = None
         threading.Thread(target=self.boot_llama, daemon=True).start()
 
     def ready(self):
@@ -926,7 +988,9 @@ class Assistant(App):
 
     def part_ready(self, part):
         self.waiting.discard(part)
-        if self.waiting:
+        if self.llama_missing and "llama" in self.waiting:
+            self.status.config(text=self.llama_missing, fg=ACCENT)
+        elif self.waiting:
             self.status.config(text="Loading " + ", ".join(sorted(self.waiting)) + "...")
         else:
             self.state = "idle"
@@ -1063,6 +1127,19 @@ class Assistant(App):
     def handle(self, kind, value):
         if kind == "part_ready":
             self.part_ready(value)
+        elif kind == "llama_missing":
+            self.llama_missing = value
+            self.status.config(text=value, fg=ACCENT)
+        elif kind == "ask_download":
+            model, download, reply = value
+            from tkinter import messagebox
+            repo = download.split(":")[0]
+            reply.put(messagebox.askyesno(
+                "Download the language model?",
+                f"{model_label(model)} isn't on this computer yet.\n\nDownload it now from Hugging Face "
+                f"({repo}, about 4.7 GB)? It is saved to {LLAMA_CACHE} or the Hugging Face cache and "
+                "only downloaded once.\n\nChoose No to skip it; you can pick another model in the settings.",
+                parent=self.root))
         elif kind == "language":
             self.detected = value
         elif kind == "token":

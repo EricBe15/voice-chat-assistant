@@ -1,13 +1,24 @@
-# Tested with Python 3.14 on Windows 10
+# Tested with Python 3.14 on Windows 10 and Python 3.13 on Apple Silicon. start.bat / start.sh install
+# these into .venv automatically (and again whenever this file changes).
 cactus-needle[mic]==3.1.0   # Whistle speech-to-text (weights download on first run)
 kokoro-onnx==0.4.7          # Kokoro text-to-speech
+phonemizer-fork==3.3.1      # espeak phonemes for Kokoro (imported as "phonemizer"); kokoro-onnx pins this version
 livekit==1.1.20             # WebRTC echo canceller (AEC3) for the assistant's own voice
-onnxruntime==1.30.0         # Silero VAD speech detector
-parakeet-mlx==0.5.3; sys_platform == "darwin" and platform_machine == "arm64"  # optional, more accurate speech to text (Apple Silicon)
+onnxruntime==1.30.0         # Silero VAD speech detector, Kokoro, and Parakeet off Apple Silicon
+# Parakeet v3, more accurate final speech to text: on the GPU on Apple Silicon, on the CPU elsewhere
+parakeet-mlx==0.5.3; sys_platform == "darwin" and platform_machine == "arm64"
+onnx-asr[hub]==0.12.0; sys_platform != "darwin" or platform_machine != "arm64"
+# Model downloads (Whistle, Parakeet). A range, not a pin: mlx-audio on Apple Silicon needs 1.x,
+# while everything else here also works with 0.3x.
+huggingface_hub>=0.30.2,<2
 numpy==2.2.6
 requests==2.32.5
 sounddevice==0.5.5
 soxr==1.1.0
-# On Apple Silicon, also: pip install --no-deps mlx-audio==0.5.7
-# (Kokoro on the GPU, ~10x faster. --no-deps: its full dependencies would downgrade huggingface_hub
-# and pull in transformers, neither of which the Kokoro model needs.)
+# On Apple Silicon the start script also runs: pip install --no-deps mlx-audio==0.5.7
+# (Kokoro on the GPU, ~10x faster. --no-deps: its full dependencies would pull in transformers and more,
+# none of which the Kokoro model needs.)
+#
+# Not installed by pip:
+# - llama.cpp (llama-server): winget install ggml.llamacpp / brew install llama.cpp. The start script offers it.
+# - Python with tkinter. On Linux also PortAudio and Tk: sudo apt install libportaudio2 python3-tk
