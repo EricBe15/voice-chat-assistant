@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Large model files: fetched by download_models.py
+models/
+
+# Personal data: voice recordings, transcripts, local paths and prompts
+logs/
+samples/
+settings.json
+
+# Secrets (none are used today, keep it that way)
+.env
+.env.*
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

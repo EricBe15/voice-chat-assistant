@@ -1,0 +1,8 @@
+# Tested with Python 3.14 on Windows 10
+cactus-needle[mic]==3.1.0   # Whistle speech-to-text (weights download on first run)
+kokoro-onnx==0.4.7          # Kokoro text-to-speech
+onnxruntime==1.30.0         # Silero VAD speech detector
+numpy==2.2.6
+requests==2.32.5
+sounddevice==0.5.5
+soxr==1.1.0
